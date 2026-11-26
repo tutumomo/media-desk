@@ -1,10 +1,11 @@
-// dsh-media-desk host 半片：/media-desk/* 接口、文件服务和模型调用。
+// 自媒體工作台後端服務：/media-desk/* 接口、本地獨立 Web 伺服器、檔案服務和模型調用。
 import { createReadStream } from 'node:fs'
 import { execFile } from 'node:child_process'
-import { stat, writeFile } from 'node:fs/promises'
+import { createServer } from 'node:http'
+import { readFile, stat, writeFile } from 'node:fs/promises'
 import { dirname, extname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
-import { assistantModelOverride, callModel, chatPrompts, defaultSelection, extractJson, modelInfo, modelStatus, setAssistantModel } from './ai.js'
+import { assistantCustomConfig, assistantModelOverride, callModel, chatPrompts, defaultSelection, extractJson, modelInfo, modelStatus, setAssistantCustom, setAssistantModel } from './ai.js'
 import { defaultExportDir, resolveExportDir, saveProduction } from './export.js'
 import { harvest, harvestText } from './harvest.js'
 import { generateImage } from './images.js'
@@ -21,7 +22,9 @@ import { currentLang, platformName, tr, withLang } from './i18n.js'
 import { localizeSamples, samplesNeedLocale } from './seed.js'
 import { createVersionCheck } from './version.js'
 
-const ASSETS_DIR = join(dirname(fileURLToPath(import.meta.url)), '..', 'assets')
+const ROOT_DIR = join(dirname(fileURLToPath(import.meta.url)), '..')
+const ASSETS_DIR = join(ROOT_DIR, 'assets')
+const DIST_DIR = join(ROOT_DIR, 'dist')
 const MAX_JSON = 4_000_000
 const MAX_UPLOAD = 250_000_000
 const MIME = { '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg', '.png': 'image/png', '.webp': 'image/webp', '.gif': 'image/gif', '.mp4': 'video/mp4', '.webm': 'video/webm', '.mov': 'video/quicktime' }
@@ -324,6 +327,7 @@ async function route(ctx, store, desk, req, res) {
         providers: settled.filter(r => r.status === 'fulfilled').map(r => r.value).filter(p => p.models.length),
         default: defaultSelection(ctx),
         current: assistantModelOverride(),
+        custom: assistantCustomConfig() ? { enabled: true, protocol: assistantCustomConfig().protocol, baseUrl: assistantCustomConfig().baseUrl, model: assistantCustomConfig().model } : null,
       })
     }
     if (path === 'insights') return json(res, 200, computeInsights(await store.read()))
@@ -360,6 +364,10 @@ async function route(ctx, store, desk, req, res) {
     case 'produce': {
       const started = await desk.producer.start(String(body.id), { withImages: body.withImages })
       return json(res, 200, { started, state: await store.read() })
+    }
+    case 'produce/apply': {
+      const production = await desk.producer.applyAgentDraft(String(body.id), body)
+      return json(res, 200, { production, state: await store.read() })
     }
     case 'produce/cancel':
       await desk.producer.cancel(String(body.id))
@@ -399,15 +407,44 @@ async function route(ctx, store, desk, req, res) {
       return json(res, 200, { path })
     }
     case 'style/extract': return json(res, 200, await extractStyle(ctx, store, body))
+    case 'style/apply': {
+      const style = normalizeStyle(body.style ?? body, typeof body.name === 'string' ? body.name.trim().slice(0, 20) : '')
+      const source = typeof body.source === 'string' && body.source.trim() ? body.source.trim() : tr('智能体提炼')
+      const sourceUrls = Array.isArray(body.sourceUrls) ? body.sourceUrls : []
+      const material = typeof body.reference === 'string' ? body.reference : typeof body.material === 'string' ? body.material : ''
+      const accountKey = typeof body.accountKey === 'string' ? body.accountKey : null
+      const result = await store.mutate(tr('提炼风格「{name}」', { name: style.name }), (draft) => {
+        const existing = accountKey ? (draft.styles ?? []).find(row => row.accountKey === accountKey) : null
+        const id = existing?.id ?? newId('st')
+        const row = { id, ...style, reference: referenceExcerpt(material), source, sourceUrls, ...(accountKey ? { accountKey } : {}), createdAt: existing?.createdAt ?? new Date().toISOString() }
+        draft.styles = existing ? draft.styles.map(entry => (entry.id === id ? row : entry)) : [row, ...(draft.styles ?? [])]
+        draft.activeStyleId = id
+        return { id, failures: [], state: draft }
+      })
+      return json(res, 200, result)
+    }
     case 'monid/import': return json(res, 200, await importAccountRoute(ctx, store, desk, body))
     case 'settings': {
       const before = modelInfo(ctx)
       const updated = await desk.settings.update(body)
       setAssistantModel(updated.assistant)
+      setAssistantCustom(updated.assistantCustom)
       const after = modelInfo(ctx)
       // 换了模型，上一个模型的失败状态不再算数
-      if (before?.provider !== after?.provider || before?.model !== after?.model) Object.assign(modelStatus, { ok: null, error: null })
+      if (before?.provider !== after?.provider || before?.model !== after?.model || before?.custom !== after?.custom) Object.assign(modelStatus, { ok: null, error: null })
       return json(res, 200, { ...publicSettings(updated, Boolean(imageTool(ctx))), defaultExportDir: defaultExportDir(), assistantEffective: modelInfo(ctx)?.label ?? null })
+    }
+    case 'assistant/test': {
+      const info = modelInfo(ctx)
+      if (!info) return json(res, 400, { error: tr('请先选择或配置助手模型') })
+      const result = await callModel(ctx, {
+        system: 'You are a concise assistant.',
+        user: 'Reply with OK.',
+        maxTokens: 32,
+        light: true,
+        signal: AbortSignal.timeout(30_000),
+      })
+      return json(res, 200, { ok: true, model: result.model, reply: result.text.trim().slice(0, 120) || 'OK' })
     }
     case 'settings/test': {
       const settings = await desk.settings.read()
@@ -460,20 +497,123 @@ export function requestRejection(ctx, req) {
 
 export const name = 'dsh-media-desk'
 
+const STANDALONE_HTML = `<!doctype html>
+<html lang="zh-CN" data-md-standalone>
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>自媒体工作台 · Media Desk</title>
+  <style>
+    html,body,#root{margin:0;padding:0;height:100%;width:100%;overflow:hidden;background:#f6f7f9;}
+    @media (prefers-color-scheme: dark){html,body,#root{background:#111216;}}
+  </style>
+  <script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+  <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+</head>
+<body>
+  <div id="root"></div>
+  <script>
+    window.__ModuleLoader__ = {
+      load({ factory }) {
+        const mod = factory(name => {
+          if (name === 'react') return window.React
+          if (name === 'react-dom') return window.ReactDOM
+          throw new Error('Unknown module: ' + name)
+        })
+        if (mod && mod.Desk && window.ReactDOM && window.React) {
+          const root = window.ReactDOM.createRoot(document.getElementById('root'))
+          root.render(window.React.createElement(mod.Desk))
+        }
+      }
+    }
+  </script>
+  <script src="/client.js"></script>
+</body>
+</html>`
+
+/**
+ * 建立獨立模式的後端上下文與實例（不依賴 DSH 容器）。
+ * @param {{root?: string, ctx?: object}} [options]
+ */
+export function createDeskContext({ root, ctx = { get: () => null } } = {}) {
+  const store = new Store(root)
+  const settings = new Settings(store.root)
+  const producer = new Producer({
+    store,
+    settings,
+    callText: options => callModel(ctx, options),
+    ready: saved => imageReady(saved, Boolean(imageTool(ctx))),
+    generate: (image, prompt, options) => image.source === 'tool' ? generateToolImage(ctx, image, prompt, options) : generateImage(image, prompt, options),
+  })
+  const monid = createMonidRunner()
+  const desk = { settings, producer, monid, versionCheck: createVersionCheck() }
+  settings.read().then(saved => {
+    setAssistantModel(saved.assistant)
+    setAssistantCustom(saved.assistantCustom)
+  }).catch(() => {})
+  return { ctx, store, settings, producer, monid, desk }
+}
+
+/**
+ * 啟動本地獨立 Web 伺服器，提供視覺化工作台 UI 與 /media-desk/* API。
+ * @param {{port?: number, host?: string, root?: string}} [options]
+ * @returns {Promise<{server: import('node:http').Server, url: string, port: number, store: Store, settings: Settings, producer: Producer}>}
+ */
+export async function startStandaloneServer({ port = Number(process.env.MEDIA_DESK_PORT) || 4311, host = '127.0.0.1', root } = {}) {
+  const { ctx, store, settings, producer, desk } = createDeskContext({ root })
+  await settings.read().then(saved => {
+    setAssistantModel(saved.assistant)
+    setAssistantCustom(saved.assistantCustom)
+  }).catch(() => {})
+  const server = createServer(async (req, res) => {
+    try {
+      const url = new URL(req.url || '/', 'http://local')
+      if ((req.method === 'GET' || req.method === 'HEAD') && (url.pathname === '/' || url.pathname === '/index.html' || url.pathname === '/media-desk' || url.pathname === '/media-desk/')) {
+        res.statusCode = 200
+        res.setHeader('content-type', 'text/html; charset=utf-8')
+        res.setHeader('cache-control', 'no-store')
+        res.end(STANDALONE_HTML)
+        return
+      }
+      if ((req.method === 'GET' || req.method === 'HEAD') && (url.pathname === '/client.js' || url.pathname === '/dist/client.js')) {
+        try {
+          const code = await readFile(join(DIST_DIR, 'client.js'))
+          res.statusCode = 200
+          res.setHeader('content-type', 'application/javascript; charset=utf-8')
+          res.setHeader('cache-control', 'no-store')
+          res.end(code)
+        } catch {
+          json(res, 404, { error: '尚未建置前端（請先執行 npm run build）' })
+        }
+        return
+      }
+      if (url.pathname.startsWith('/media-desk/')) {
+        await withLang(req.headers['x-media-desk-lang'], () => route(ctx, store, desk, req, res))
+        return
+      }
+      json(res, 404, { error: tr('接口不存在') })
+    } catch (err) {
+      if (res.headersSent) {
+        res.end()
+        return
+      }
+      json(res, err.status || 500, { error: err.message })
+    }
+  })
+
+  await new Promise((resolve, reject) => {
+    server.once('error', reject)
+    server.listen(port, host, resolve)
+  })
+  const address = server.address()
+  const actualPort = typeof address === 'object' && address ? address.port : port
+  return { server, url: `http://${host}:${actualPort}`, port: actualPort, store, settings, producer }
+}
+
 export default {
   inject: ['webServer', 'connection'],
   apply(ctx) {
-    const store = new Store()
-    const settings = new Settings(store.root)
-    const producer = new Producer({
-      store, settings, callText: options => callModel(ctx, options),
-      ready: saved => imageReady(saved, Boolean(imageTool(ctx))),
-      generate: (image, prompt, options) => image.source === 'tool' ? generateToolImage(ctx, image, prompt, options) : generateImage(image, prompt, options),
-    })
-    const monid = createMonidRunner()
-    const desk = { settings, producer, monid, versionCheck: createVersionCheck() }
-    // 启动时恢复用户在工作台里选过的助手模型
-    settings.read().then(saved => setAssistantModel(saved.assistant)).catch(() => {})
+    const { store, desk } = createDeskContext({ ctx })
     ctx.effect(() => ctx.webServer.register({
       kind: 'prefix',
       path: '/media-desk',

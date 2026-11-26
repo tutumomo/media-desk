@@ -161,16 +161,34 @@ export async function fetchModels() {
   return request('models')
 }
 
-/** 切换助手模型；两个字段都空表示跟随默认。 */
+/** 切换助手模型；支持指定 Harness 模型或自定义第三方模型。 */
 export async function saveAssistant(assistant) {
   try {
-    const settings = await request('settings', { assistant })
-    setDesk({ settings, model: settings.assistantEffective ?? snapshot.model })
+    const payload = assistant && ('assistant' in assistant || 'assistantCustom' in assistant)
+      ? assistant
+      : { assistant, assistantCustom: { enabled: false } }
+    const settings = await request('settings', payload)
+    setDesk({ settings, model: settings.assistantEffective ?? null })
     toast(t('助手模型已切换'))
     return true
   } catch (err) {
     report(err)
     return false
+  }
+}
+
+export async function testAssistant(custom) {
+  try {
+    const settings = await request('settings', {
+      assistantCustom: { ...custom, enabled: true },
+    })
+    setDesk({ settings, model: settings.assistantEffective ?? null })
+    const res = await request('assistant/test', {})
+    toast(t('模型连接成功：{model}', { model: res.model }))
+    return res
+  } catch (err) {
+    report(err)
+    return null
   }
 }
 

@@ -7,6 +7,8 @@ const DEFAULTS = {
   image: { source: 'http', protocol: 'openai', baseUrl: '', model: '', apiKey: '', size: '1536x1024', quality: '', toolSize: '1536x1024', toolQuality: '', extra: '' },
   // 助手文字模型：空对象表示跟随 DeepSeek Harness 默认模型
   assistant: { provider: '', model: '' },
+  // 自定义第三方文字模型：enabled 为 true 时优先使用这里配置的接口
+  assistantCustom: { enabled: false, protocol: 'openai', baseUrl: '', model: '', apiKey: '' },
   voice: '',
   exportDir: '',
   generateImages: true,
@@ -30,7 +32,13 @@ export class Settings {
     // 每次都读文件：桌面版和 Web 版可能同时运行
     try {
       const saved = JSON.parse(await readFile(this.file, 'utf8'))
-      this.value = { ...DEFAULTS, ...saved, image: { ...DEFAULTS.image, ...saved.image }, assistant: { ...DEFAULTS.assistant, ...(saved.assistant ?? {}) } }
+      this.value = {
+        ...DEFAULTS,
+        ...saved,
+        image: { ...DEFAULTS.image, ...saved.image },
+        assistant: { ...DEFAULTS.assistant, ...(saved.assistant ?? {}) },
+        assistantCustom: { ...DEFAULTS.assistantCustom, ...(saved.assistantCustom ?? {}) },
+      }
     } catch (err) {
       if (err.code !== 'ENOENT') throw err
       this.value = structuredClone(DEFAULTS)
@@ -98,6 +106,30 @@ export class Settings {
       if (Boolean(provider) !== Boolean(model)) throw Object.assign(new Error(tr('助手模型的提供方和模型要一起填')), { status: 400 })
       next.assistant = { provider, model }
     }
+    if (patch.assistantCustom && typeof patch.assistantCustom === 'object') {
+      const ac = patch.assistantCustom
+      if (ac.enabled !== undefined) next.assistantCustom.enabled = Boolean(ac.enabled)
+      if (ac.protocol !== undefined) {
+        if (!['openai', 'anthropic'].includes(ac.protocol)) throw Object.assign(new Error(tr('助手模型协议无效')), { status: 400 })
+        next.assistantCustom.protocol = ac.protocol
+      }
+      if (typeof ac.model === 'string') next.assistantCustom.model = ac.model.trim().slice(0, 200)
+      if (typeof ac.baseUrl === 'string') {
+        let url = ac.baseUrl.trim().replace(/\/+$/, '')
+        if (next.assistantCustom.protocol === 'anthropic') {
+          url = url.replace(/\/messages$/i, '')
+        } else {
+          url = url.replace(/\/chat\/completions$/i, '')
+        }
+        if (url && !/^https?:\/\/[^\s]+$/i.test(url)) throw Object.assign(new Error(tr('接口地址要以 http:// 或 https:// 开头')), { status: 400 })
+        next.assistantCustom.baseUrl = url
+      }
+      if (typeof ac.apiKey === 'string' && ac.apiKey.trim()) next.assistantCustom.apiKey = ac.apiKey.trim()
+      if (ac.clearKey === true) next.assistantCustom.apiKey = ''
+      if (next.assistantCustom.enabled && (!next.assistantCustom.baseUrl || !next.assistantCustom.model)) {
+        throw Object.assign(new Error(tr('启用自定义助手模型时，接口地址和模型不能为空')), { status: 400 })
+      }
+    }
     if (typeof patch.voice === 'string') next.voice = patch.voice.slice(0, 8000)
     if (typeof patch.exportDir === 'string') next.exportDir = patch.exportDir.trim().slice(0, 500)
     if (typeof patch.generateImages === 'boolean') next.generateImages = patch.generateImages
@@ -121,5 +153,12 @@ export function imageReady(settings, toolAvailable = false) {
 /** 发给浏览器的版本：只告诉它有没有密钥和末四位。 */
 export function publicSettings(settings, toolAvailable = false) {
   const { apiKey, ...image } = settings.image
-  return { ...settings, image: { ...image, hasKey: Boolean(apiKey), keyHint: apiKey ? apiKey.slice(-4) : '' }, imageToolAvailable: toolAvailable, imageReady: imageReady(settings, toolAvailable) }
+  const { apiKey: assistantKey, ...assistantCustom } = settings.assistantCustom ?? DEFAULTS.assistantCustom
+  return {
+    ...settings,
+    image: { ...image, hasKey: Boolean(apiKey), keyHint: apiKey ? apiKey.slice(-4) : '' },
+    assistantCustom: { ...assistantCustom, hasKey: Boolean(assistantKey), keyHint: assistantKey ? assistantKey.slice(-4) : '' },
+    imageToolAvailable: toolAvailable,
+    imageReady: imageReady(settings, toolAvailable),
+  }
 }

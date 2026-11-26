@@ -16,6 +16,8 @@ export const modelStatus = { ok: null, error: null }
 
 // 工作台里用户自己指定的助手模型；null 表示跟随 DeepSeek Harness 默认模型
 let assistantOverride = null
+// 用户在工作台配置的自定义第三方文字模型；启用时优先于 Harness
+let assistantCustom = null
 
 export function setAssistantModel(sel) {
   assistantOverride = sel?.provider && sel?.model ? { provider: sel.provider, model: sel.model } : null
@@ -25,9 +27,19 @@ export function assistantModelOverride() {
   return assistantOverride
 }
 
+export function setAssistantCustom(cfg) {
+  assistantCustom = cfg?.enabled && cfg?.baseUrl && cfg?.model
+    ? { protocol: cfg.protocol || 'openai', baseUrl: cfg.baseUrl, model: cfg.model, apiKey: cfg.apiKey || '' }
+    : null
+}
+
+export function assistantCustomConfig() {
+  return assistantCustom
+}
+
 export function defaultSelection(ctx) {
   try {
-    const selection = ctx.get('agentDefaultModel')?.currentSelection()
+    const selection = ctx?.get?.('agentDefaultModel')?.currentSelection()
     return selection?.provider && selection?.model ? { provider: selection.provider, model: selection.model } : null
   } catch {
     return null
@@ -35,10 +47,171 @@ export function defaultSelection(ctx) {
 }
 
 export function modelInfo(ctx) {
-  if (!ctx.get('llm')) return null
+  if (assistantCustom) {
+    return { provider: 'custom', model: assistantCustom.model, label: assistantCustom.model, custom: true }
+  }
+  if (!ctx?.get?.('llm')) return null
   const route = assistantOverride ?? defaultSelection(ctx)
   if (!route) return null
   return { provider: route.provider, model: route.model, label: route.model }
+}
+
+function redactKey(text, key) {
+  const clean = String(text ?? '').slice(0, 300)
+  return key ? clean.split(key).join('***') : clean
+}
+
+function explainLlmHttp(status, detail) {
+  if (status === 401 || status === 403) return tr('密钥无效或没有这个模型的权限（{status}）', { status })
+  if (status === 404) return tr('接口地址或模型不对（404）')
+  if (status === 429) return tr('请求太频繁或额度不足（429）')
+  return detail ? tr('模型服务返回 {status}：{detail}', { status, detail }) : tr('模型服务返回 {status}', { status })
+}
+
+async function parseErrorDetail(res, apiKey) {
+  const raw = await res.text().catch(() => '')
+  let detail = raw
+  try {
+    const data = JSON.parse(raw)
+    detail = data?.error?.message || data?.message || raw
+  } catch {
+    // 非 JSON 响应直接用文本
+  }
+  return redactKey(detail, apiKey)
+}
+
+async function readSseLines(body, onData) {
+  const decoder = new TextDecoder()
+  let buffer = ''
+  for await (const chunk of body) {
+    buffer += typeof chunk === 'string' ? chunk : decoder.decode(chunk, { stream: true })
+    const lines = buffer.split(/\r?\n/)
+    buffer = lines.pop() ?? ''
+    for (const line of lines) {
+      const trimmed = line.trim()
+      if (!trimmed.startsWith('data:')) continue
+      const payload = trimmed.slice(5).trim()
+      if (!payload || payload === '[DONE]') continue
+      onData(payload)
+    }
+  }
+  const tail = buffer.trim()
+  if (tail.startsWith('data:')) {
+    const payload = tail.slice(5).trim()
+    if (payload && payload !== '[DONE]') onData(payload)
+  }
+}
+
+async function callCustomModel(cfg, { system, user, maxTokens = 4000, signal, onText }) {
+  const sys = currentLang() === 'en' ? `${system}\n${ENGLISH_DIRECTIVE}` : system
+  const effectiveSignal = signal ?? AbortSignal.timeout(120_000)
+  const wantStream = Boolean(onText)
+
+  if (cfg.protocol === 'anthropic') {
+    const endpoint = /\/v\d+(?:beta)?$/i.test(cfg.baseUrl) ? `${cfg.baseUrl}/messages` : `${cfg.baseUrl}/v1/messages`
+    const headers = {
+      'content-type': 'application/json',
+      'anthropic-version': '2023-06-01',
+      ...(cfg.apiKey ? { 'x-api-key': cfg.apiKey, authorization: `Bearer ${cfg.apiKey}` } : {}),
+    }
+    const res = await fetch(endpoint, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify({
+        model: cfg.model,
+        max_tokens: maxTokens,
+        ...(sys ? { system: sys } : {}),
+        messages: [{ role: 'user', content: user }],
+        stream: wantStream,
+      }),
+      signal: effectiveSignal,
+    })
+    if (!res.ok) {
+      const detail = await parseErrorDetail(res, cfg.apiKey)
+      throw new Error(explainLlmHttp(res.status, detail))
+    }
+    const ctype = (res.headers.get('content-type') || '').toLowerCase()
+    if (ctype.includes('text/event-stream') && res.body) {
+      let text = ''
+      let streamErr = null
+      await readSseLines(res.body, (payload) => {
+        let evt
+        try { evt = JSON.parse(payload) } catch { return }
+        if (evt?.type === 'error' || evt?.error) {
+          streamErr = evt?.error?.message || evt?.message || tr('模型调用失败')
+          return
+        }
+        const delta = evt?.type === 'content_block_delta' && evt?.delta?.type === 'text_delta'
+          ? evt.delta.text
+          : evt?.delta?.text ?? ''
+        if (delta) {
+          text += delta
+          onText?.(delta)
+        }
+      })
+      if (streamErr) throw new Error(redactKey(streamErr, cfg.apiKey))
+      return { text, model: cfg.model }
+    }
+    const data = await res.json()
+    if (data?.error) throw new Error(redactKey(data.error.message || JSON.stringify(data.error), cfg.apiKey))
+    const text = Array.isArray(data?.content)
+      ? data.content.filter(b => b?.type === 'text' || typeof b?.text === 'string').map(b => b.text).join('')
+      : String(data?.completion ?? '')
+    if (text) onText?.(text)
+    return { text, model: cfg.model }
+  }
+
+  // OpenAI 兼容协议 (/chat/completions)
+  const endpoint = `${cfg.baseUrl}/chat/completions`
+  const headers = {
+    'content-type': 'application/json',
+    ...(cfg.apiKey ? { authorization: `Bearer ${cfg.apiKey}` } : {}),
+  }
+  const messages = [
+    ...(sys ? [{ role: 'system', content: sys }] : []),
+    { role: 'user', content: user },
+  ]
+  const res = await fetch(endpoint, {
+    method: 'POST',
+    headers,
+    body: JSON.stringify({
+      model: cfg.model,
+      messages,
+      max_tokens: maxTokens,
+      stream: wantStream,
+    }),
+    signal: effectiveSignal,
+  })
+  if (!res.ok) {
+    const detail = await parseErrorDetail(res, cfg.apiKey)
+    throw new Error(explainLlmHttp(res.status, detail))
+  }
+  const ctype = (res.headers.get('content-type') || '').toLowerCase()
+  if (ctype.includes('text/event-stream') && res.body) {
+    let text = ''
+    let streamErr = null
+    await readSseLines(res.body, (payload) => {
+      let evt
+      try { evt = JSON.parse(payload) } catch { return }
+      if (evt?.error) {
+        streamErr = evt.error.message || JSON.stringify(evt.error)
+        return
+      }
+      const delta = evt?.choices?.[0]?.delta?.content ?? ''
+      if (delta) {
+        text += delta
+        onText?.(delta)
+      }
+    })
+    if (streamErr) throw new Error(redactKey(streamErr, cfg.apiKey))
+    return { text, model: cfg.model }
+  }
+  const data = await res.json()
+  if (data?.error) throw new Error(redactKey(data.error.message || JSON.stringify(data.error), cfg.apiKey))
+  const msg = data?.choices?.[0]?.message?.content ?? data?.choices?.[0]?.text ?? ''
+  const text = Array.isArray(msg) ? msg.map(part => part?.text ?? '').join('') : String(msg ?? '')
+  if (text) onText?.(text)
+  return { text, model: cfg.model }
 }
 
 /**
@@ -48,6 +221,18 @@ export function modelInfo(ctx) {
  * @returns {Promise<{text: string, model: string}>} 完整文本与模型名。
  */
 export async function callModel(ctx, { system, user, maxTokens = 4000, signal, onText, light = false, sessionId = PLUGIN_SESSION_ID }) {
+  if (assistantCustom) {
+    try {
+      const result = await callCustomModel(assistantCustom, { system, user, maxTokens, signal, onText })
+      modelStatus.ok = true
+      modelStatus.error = null
+      return result
+    } catch (err) {
+      modelStatus.ok = false
+      modelStatus.error = err.message
+      throw err
+    }
+  }
   const info = modelInfo(ctx)
   if (!info) throw new Error(tr('当前没有可用模型'))
   const llm = ctx.get('llm')
