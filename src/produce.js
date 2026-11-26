@@ -398,4 +398,100 @@ export class Producer {
   anyAssetActive(id) {
     return [...this.assets].some(key => key.startsWith(`${id}:`))
   }
+
+  /**
+   * 由宿主智能體直接寫入成稿（策劃案 JSON + 完整腳本/文章 Markdown），並可選自動觸發生圖流水線。
+   * @param {string} id - 靈感 ID。
+   * @param {{plan?: object, article?: string, format?: string, engine?: string, withImages?: boolean}} payload - 智能體生成的內容。
+   */
+  async applyAgentDraft(id, { plan: rawPlan = {}, article: rawArticle = '', format, engine = 'agent', withImages } = {}) {
+    const state = await this.store.read()
+    const item = state.items.find(row => row.id === id)
+    if (!item) throw Object.assign(new Error(tr('找不到这条灵感')), { status: 404 })
+    const settings = await this.settings.read()
+    const draw = typeof withImages === 'boolean' ? withImages : settings.generateImages !== false
+    const backup = normalizePlan(fallbackPlan(item, rawArticle, settings), settings, item.title)
+    const plan = normalizePlan(rawPlan, settings, item.title)
+    if (plan.images.length < settings.imageCount) plan.images = [...plan.images, ...backup.images.slice(plan.images.length)]
+    if (plan.shots.length < settings.shotCount) plan.shots = [...plan.shots, ...backup.shots.slice(plan.shots.length).map((row, i) => ({ ...row, no: plan.shots.length + i + 1 }))]
+    const { title, article } = splitTitle(rawArticle || fallbackArticle(state, item), plan.title)
+    const finalTitle = rawPlan?.title ? plan.title : title
+
+    const configured = this.ready(settings)
+    const ready = configured && draw
+    const initial = ready ? 'pending' : 'skipped'
+
+    await this.store.mutate('智能体写入成稿', (draft) => {
+      const target = draft.items.find(row => row.id === id)
+      const { savedPath, savedHashes } = target.production ?? {}
+      target.production = {
+        status: ready ? 'running' : 'done',
+        stage: ready ? 'making' : 'done',
+        withImages: draw,
+        startedAt: new Date().toISOString(),
+        ...(ready ? {} : { finishedAt: new Date().toISOString() }),
+        format: draftFormat(format ?? target.production?.format ?? draft.draftFormat),
+        title: finalTitle,
+        coverText: plan.coverText,
+        facts: plan.facts,
+        outline: plan.outline,
+        characters: plan.characters,
+        article,
+        aiArticle: article,
+        engine,
+        notice: null,
+        cover: { prompt: plan.cover, status: initial },
+        images: plan.images.map(row => ({ ...row, status: initial })),
+        shots: plan.shots.map(row => ({ ...row, status: initial })),
+        ...(!configured && draw ? { needsProvider: true } : {}),
+        ...(savedPath ? { savedPath, savedHashes } : {}),
+      }
+      if (!ready && ['idea', 'outline'].includes(target.status)) target.status = target.scheduledAt ? 'ready' : 'draft'
+      return draft
+    }, { undoable: false })
+
+    if (ready) {
+      await this.renderAllAssets(id)
+    }
+    return (await this.store.read()).items.find(row => row.id === id)?.production
+  }
+
+  /**
+   * 批次渲染指定成稿中所有待繪製或指定目標的圖片（封面、配圖、分鏡）。
+   * @param {string} id - 靈感 ID。
+   * @param {{targets?: string[], signal?: AbortSignal}} [options]
+   */
+  async renderAllAssets(id, { targets: customTargets, signal } = {}) {
+    const settings = await this.settings.read()
+    if (!this.ready(settings)) throw Object.assign(new Error(tr('还没有接入生图模型')), { status: 400 })
+    const state = await this.store.read()
+    const production = state.items.find(row => row.id === id)?.production
+    if (!production) throw Object.assign(new Error(tr('找不到这条灵感')), { status: 404 })
+    const targets = customTargets ?? [
+      'cover',
+      ...(production.images ?? []).map((_, i) => `image:${i}`),
+      ...(production.shots ?? []).map((_, i) => `shot:${i}`),
+    ]
+    let next = 0
+    const worker = async () => {
+      while (next < targets.length && !signal?.aborted) {
+        const target = targets[next]
+        next += 1
+        await this.renderAsset(id, target, settings, signal)
+      }
+    }
+    const workers = []
+    for (let i = 0; i < CONCURRENCY; i += 1) workers.push(worker())
+    await Promise.all(workers)
+    await this.store.mutate('完成成稿画面', (draft) => {
+      const target = draft.items.find(row => row.id === id)
+      if (!target?.production) return draft
+      target.production.status = 'done'
+      target.production.stage = 'done'
+      target.production.finishedAt = new Date().toISOString()
+      if (['idea', 'outline'].includes(target.status)) target.status = target.scheduledAt ? 'ready' : 'draft'
+      return draft
+    }, { undoable: false })
+    return (await this.store.read()).items.find(row => row.id === id)?.production
+  }
 }

@@ -251,3 +251,6 @@ function mountBetterSidebar(ctx) {
     console.warn('[dsh-media-desk] better-sidebar tab skipped:', error)
   }
 }
+
+export { Desk }
+

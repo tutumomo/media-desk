@@ -57,8 +57,10 @@ export function revertChange(before, after, current) {
 }
 
 export function dshHome(env = process.env) {
-  return env.DSH_HOME || join(homedir(), '.dsh')
+  return env.MEDIA_DESK_HOME || env.DSH_HOME || join(homedir(), '.dsh')
 }
+
+export const mediaDeskHome = dshHome
 
 export class Store {
   constructor(root = join(dshHome(), 'media-desk')) {
